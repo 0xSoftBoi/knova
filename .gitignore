@@ -1,0 +1,7 @@
+# Build artifacts. ~9.5 GB for this workspace.
+/target/
+
+# Backup and editor files
+*.bak
+*~
+.DS_Store

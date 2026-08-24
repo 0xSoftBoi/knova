@@ -1,0 +1,4 @@
+# Proper nouns that clippy::doc_markdown would otherwise want in backticks.
+# Backticks mean "this is code"; these are product names in prose.
+# ".." extends clippy's default list rather than replacing it.
+doc-valid-idents = ["SQLite", "PostgreSQL", ".."]

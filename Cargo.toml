@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/common",
+    "crates/auth-service",
+    "crates/profile-service",
+    "crates/loadgen",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+repository = "https://github.com/0xSoftBoi/knova"
+authors = ["Knova coding exercise"]
+
+# Lints are declared once here and inherited by every member via
+# `[lints] workspace = true`, so a new crate cannot opt out by omission.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Single source of truth for dependency versions across every crate in the
+# workspace. Member crates say `axum.workspace = true` instead of pinning their
+# own version, so the gateway and the profile service can never drift onto
+# incompatible versions of a shared type (e.g. two different `http::HeaderMap`).
+[workspace.dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+# `rc` lets `Arc<Profile>` serialize directly, so a read can hand the
+# response the shared projection instead of cloning it.
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+argon2 = { version = "0.5", features = ["std"] }
+# argon2 does not re-export password-hash's `getrandom` feature, and without it
+# `SaltString::generate` has no OS RNG to draw from. Depending on password-hash
+# directly lets cargo's feature unification switch it on for the shared copy.
+password-hash = { version = "0.5", features = ["getrandom"] }
+jsonwebtoken = "9"
+# Constant-time comparison for the shared internal token.
+subtle = "2"
+async-trait = "0.1"
+# No lock poisoning: a panic while holding a guard cannot brick one account
+# until the process restarts.
+parking_lot = "0.12"
+# Profile keys come from tokens this workspace signed, never from an attacker,
+# so SipHash's collision-DoS resistance buys nothing here.
+rustc-hash = "2"
+# Lock-free reads of the current projection: a reader loads an Arc without
+# taking any lock, so a hot profile stops serialising its readers.
+arc-swap = "1"
+# `bundled` compiles SQLite from vendored C, so the build needs no system
+# library. Used with an in-memory database, per the brief.
+rusqlite = { version = "0.37", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+common = { path = "crates/common" }
