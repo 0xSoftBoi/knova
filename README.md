@@ -4,22 +4,307 @@ Two Rust microservices. The authorization service owns credentials and fronts
 the profile service as an API gateway; clients never address the profile
 service directly.
 
+## Walkthrough
+
+The slide deck, inline. Ten slides; the detailed write-up for each point is
+further down. A self-contained HTML version is in [`docs/walkthrough.html`](docs/walkthrough.html),
+alongside a source browser in [`docs/source.html`](docs/source.html).
+
+---
+
+### 01 · Knova — Senior Rust Engineer
+
+> ## Lost updates and enumeration oracles.
+
+Two microservices are forty-five minutes of work. The exercise is really asking
+two questions: can you tell the difference between three kinds of concurrency
+bug, and do you know that matching a status code is only half of hiding whether
+an account exists.
+
+| | |
+|---|---|
+| **52** | tests, all green |
+| **0** | clippy findings at pedantic |
+| **+18%** | gateway throughput, one line |
+
+---
+
+### 02 · Architecture
+
+> ## One trust boundary, crossed once.
+
+The profile service never sees a token and never validates one. Verification
+lives in exactly one place.
+
+```mermaid
+flowchart TB
+    C["client<br/><i>only ever talks here</i>"]
+
+    subgraph AUTH["auth-service :8080"]
+        direction TB
+        G["throttle · semaphore · timeouts<br/>strips client-supplied identity headers"]
+        L["POST /login — argon2id → JWT"]
+        O["POST /logout — revoke jti"]
+        P["GET · POST · PUT /profile<br/>verify JWT, then forward"]
+    end
+
+    subgraph PROF["profile-service :8081"]
+        direction TB
+        N["no token ever reaches here"]
+        K["constant-time internal-secret check"]
+        V["versioned records, append-only"]
+    end
+
+    D["any direct caller"]
+
+    C --> G
+    G --> L
+    G --> O
+    G --> P
+    P -->|"x-internal-token<br/>x-user-id (from the verified token)"| K
+    K --> N
+    N --> V
+    D -.->|"403"| K
 ```
-                    ┌──────────────────────────────────────┐
-  client ──────────►│  auth-service            :8080       │
-  (only ever        │  POST /login    argon2id + JWT       │
-   talks here)      │  POST /profile ─┐                    │
-                    │  GET  /profile ─┤ verify JWT,        │
-                    │  PUT  /profile ─┘ inject identity    │
-                    └───────────┬──────────────────────────┘
-                                │ x-internal-token (constant-time checked)
-                                │ x-user-id       (from the verified token)
-                    ┌───────────▼──────────────────────────┐
-                    │  profile-service         :8081       │
-                    │  never sees or validates a token     │
-                    │  in-memory store, versioned records  │
-                    └──────────────────────────────────────┘
+
+---
+
+### 03 · The concurrency question
+
+> ## Three hazards. Only one is hard.
+
+| Hazard | What it looks like | What fixes it |
+|---|---|---|
+| **data race** | two threads, same bytes, no synchronisation | the compiler. No design effort — I don't claim credit for it. |
+| **torn write** | new address beside the old phone number | any lock around the record |
+| **lost update** | two clients edit v4, second silently erases the first, both get 200 | **no lock can fix this** — the window spans two round-trips with human think-time in it |
+
+**Why a mutex isn't the answer.** You cannot hold a lock across a user's coffee
+break. The read and the write are separate requests.
+
+**What is.** Optimistic concurrency. The record carries a version; a writer
+states which version it believes it is replacing; a stale belief is refused.
+
+---
+
+### 04 · The decision
+
+> ## If-Match is mandatory, not optional.
+
+```mermaid
+sequenceDiagram
+    participant A as client A
+    participant S as profile store
+    participant B as client B
+
+    A->>S: GET /profile
+    S-->>A: 200 · ETag "4"
+    B->>S: GET /profile
+    S-->>B: 200 · ETag "4"
+
+    A->>S: PUT If-Match "4"
+    S-->>A: 200 · now v5
+    Note over S: version advances here —<br/>B's belief is now stale
+
+    B->>S: PUT If-Match "4"
+    S-->>B: 412 · ETag "5"
+    Note over B: retries against v5,<br/>no extra round-trip to discover it
 ```
+
+- **428, not 200.** A PUT with no `If-Match` can't say which version it means to replace. Refused.
+- **`*` is rejected.** `If-Match: *` means "any version" — exactly the overwrite this prevents.
+- **412 carries the ETag.** So the client retries without a second round-trip to discover what it lost to.
+
+---
+
+### 05 · Scalability
+
+> ## The guarantee has to outlive the HashMap.
+
+A process-local store makes `If-Match: "4"` meaningful only to the instance that
+issued version 4. Behind a load balancer with three replicas there are three
+histories and the guarantee is void. So storage is a trait, with two real
+backends.
+
+**In-memory · default**
+
+```text
+[ RwLock<HashMap<UserId, Arc<Record>>> ; 64 ]
+  ^^^^^^ sharded, 4 per core
+
+Record { ArcSwap<Profile>, Mutex<Vec<Revision>> }
+         ^^^^^^^ reads take no lock at all
+```
+
+Shard guard released before the entry is touched — holding both is a global lock
+in disguise.
+
+**SQLite · same contract**
+
+```sql
+UPDATE profiles SET version = ?
+WHERE user_id = ? AND version = ?
+```
+
+Row count decides. One row: applied. Zero: stale or missing, told apart by a read
+in the same transaction.
+
+| Evidence | Result |
+|---|---|
+| One conformance suite, both backends | **8 × 2 PASS** |
+| Delete the `AND version = ?` predicate from either | **3 FAIL, SYMMETRIC** |
+
+---
+
+### 06 · Measurement
+
+> ## I optimised the wrong thing first.
+
+Round one tuned the store and the middleware, in-process, and got real numbers.
+Round two measured the running system over real HTTP and made most of round one
+irrelevant.
+
+**Round one · in-process**
+
+| | gain |
+|---|---|
+| shard the map (64 shards) | +52% store reads |
+| merge two middleware layers | 439 ns/req |
+| store read, as share of a request | 1.5% |
+
+Each `from_fn` layer costs ~900 ns whatever it does — more than the handler it guards.
+
+**Round two · the real system**
+
+| | req/sec | p50 |
+|---|---|---|
+| direct to profile | 64,158 | 898 µs |
+| through the gateway | 25,414 | 2.42 ms |
+
+The hop costs **60% of throughput** — ~29 µs/request. Everything in round one
+totalled 439 nanoseconds. The hop is **67× larger than all of it**.
+
+The biggest win was a bug I wrote: `EnvFilter` default `"info,tower_http=debug"`
+→ two formatted log lines per request · 320,006 lines across a 160,000-request
+run → changing it to `"info"`: **+18% throughput, −0.45 ms p50**, and it stops
+filling a disk in production.
+
+---
+
+### 07 · Security
+
+> ## Matching the body is the easy half.
+
+**Structural, not conventional**
+
+```rust
+pub enum Authentication {
+    Authenticated(Arc<UserRecord>),
+    Rejected,
+}
+```
+
+Unknown username and wrong password both produce `Rejected`. The distinction
+never leaves the module, so no handler can leak what it was never given.
+
+**And the timing half.** A lookup miss verifies against a decoy hash — a real
+Argon2 hash of a value no account holds. Same work, always false. A throttled
+account gets the identical 401 and still pays for a full verification; otherwise
+lockout becomes the oracle: five failures tells you the username is real.
+
+| Measured | Unknown user | Known, wrong password |
+|---|---|---|
+| before warming the decoy | 0.94 s | 0.47 s |
+| after | 0.46 s | 0.46 s |
+
+The decoy sat behind a `OnceLock`, so the first unknown-username login per
+process computed it and then verified against it — two Argon2 passes where a real
+account costs one. Found in a stray outlier in an unrelated throttle test.
+
+---
+
+### 08 · Where AI got it wrong
+
+> ## Three, ascending by cost.
+
+1. **Reflex.** `tokio::sync::Mutex` because "it's async code". No critical
+   section here crosses an `.await`, so the std lock is correct and faster. The
+   tell is a justification about the file, not about the code.
+2. **Silent leak.** `#[derive(Debug)]` on a struct holding `jwt_secret`. One
+   `tracing::debug!(?config)` from putting the signing key in the log
+   aggregator. Nothing warns — not rustc, not clippy.
+3. **A vacuous test.** My own. 64 writers, assert version is 65. **It passed on
+   deliberately broken code** — last-write-wins also accepts every write and also
+   bumps the version.
+
+```text
+MUTANT: compare-and-swap predicate removed
+FAILED  stale_update_is_rejected
+FAILED  concurrent_increments_never_lose_an_update
+ok      concurrent_writes_are_never_torn   ← correctly survives: the mutex is untouched
+```
+
+The fix was making each writer's value depend on what it read — a shared counter,
+64 increments, final must be 64. Counting accepted writes can never distinguish
+the two designs. A suite where every test dies on every mutation isn't precise
+either.
+
+---
+
+### 09 · Agentic reflection
+
+> ## Specify the invariant, design the falsification.
+
+**Delegate.** Mechanical breadth. Scaffolding, the fourth endpoint that looks
+like the first three, exhaustive error paths, doc comments, guideline audits.
+Adversarial review — "what would make CI reject this" is a question an agent
+answers tirelessly and a human answers once.
+
+**Keep deterministic.** Anything where being right beats being fast and the check
+is cheap. `forbid(unsafe_code)`, pedantic clippy, `missing_docs`, mutation runs.
+Policy an agent cannot argue with.
+
+**Keep human.** The trust boundary. Where the internal token is checked, what the
+gateway strips, whether `If-Match` is mandatory. An agent will happily make it
+optional because that's friendlier, and nothing goes red.
+
+**The engineer's job.** The code was the cheap part. The expensive parts were
+deciding lost updates were the real requirement, and noticing the test for it
+proved nothing. Reviewing generated code line by line does not scale; deciding
+what would prove it wrong does.
+
+**Getting context to an agent.** Ascending by cost: commit it (README,
+architecture notes); **encode it as executable checks** so it's enforced rather
+than remembered; give the agent tools to discover it — run the tests, fetch the
+API guidelines, curl the running service. Only genuinely external constraints go
+in the prompt.
+
+---
+
+### 10 · With more time
+
+> ## What I know is still wrong.
+
+**Closed under "if this were a bank"**
+
+- **Upstream timeouts** — reqwest has none by default; a hanging upstream hung every gateway request forever. Now 502 at 5.01 s.
+- **Login memory bound** — Argon2 at 19 MiB × 512 blocking threads ≈ 9.7 GiB from one attacker. Now sheds with 503.
+- **Audit trail** — a profile is a projection of its revisions. An address change is a KYC signal; overwriting destroyed the evidence.
+- Idempotency, revocation, key rotation, throttling, correlation.
+
+**Still open, honestly**
+
+- The gateway hop is 60% of throughput and no tuning change fixes it. Removing it for reads means either verifying tokens in both services — giving up the single trust boundary — or caching at the gateway, which reintroduces the staleness the version counter exists to prevent.
+- Throttle and idempotency state is per-process — the same flaw the profile store had. Five replicas means five counters and a limit five times what it says.
+- One SQLite connection behind a mutex — right for `:memory:`, needs a pool otherwise.
+- No metrics — spans correlate, but nothing alerts on throttle trips or 412 rate.
+
+And a caveat worth saying out loud: this is past a three-hour timebox. The
+in-memory backend alone satisfies the brief. I kept the rest because per-process
+versioning is the design's real limit, and I wanted to show it wasn't
+load-bearing.
+
+---
 
 ## Running it
 
