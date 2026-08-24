@@ -151,7 +151,7 @@ in the same transaction.
 
 | Evidence | Result |
 |---|---|
-| One conformance suite, both backends | **8 × 2 PASS** |
+| One conformance suite, both backends | **10 × 2 PASS** |
 | Delete the `AND version = ?` predicate from either | **3 FAIL, SYMMETRIC** |
 
 ---
@@ -442,7 +442,7 @@ where the bytes live, and there are two implementations:
   `IMMEDIATE` transaction. Opened in memory, per the brief; pointing it at a
   file or at Postgres changes this module and nothing above it.
 
-Both pass the *same* suite (`tests/repository_conformance.rs`, 8 tests × 2
+Both pass the *same* suite (`tests/repository_conformance.rs`, 10 tests × 2
 backends), which is the actual evidence that the concurrency guarantee is a
 property of the design rather than of one data structure. Deleting the
 compare-and-swap predicate from either backend fails three tests in that
